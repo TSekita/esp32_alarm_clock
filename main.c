@@ -1,6 +1,8 @@
 #include "driver/i2c.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "driver/gpio.h"
+#include "freertos/queue.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -12,12 +14,58 @@
 #define I2C_MASTER_RX_BUF_DISABLE   0
 #define I2C_MASTER_TIMEOUT_MS       1000
 
+#define SNOOZE_SWITCH_GPIO GPIO_NUM_5  // GPIO pin for snooze switch
+static QueueHandle_t gpio_evt_queue = NULL;
+volatile bool snooze_enabled = false;
+
 #define LCD_ADDR        0x27  // PCF8574のアドレス
 #define RX8900_ADDR     0x32
 
 #define LCD_BACKLIGHT   0x08
 #define ENABLE          0x04
 #define RS              0x01
+
+// 割り込みハンドラ
+static void IRAM_ATTR snooze_isr_handler(void *arg)
+{
+    uint32_t gpio_num = (uint32_t) arg;
+    xQueueSendFromISR(gpio_evt_queue, &gpio_num, NULL);
+}
+
+
+// 時計のアイコン用のカスタムキャラクター
+uint8_t clock_char[8] = {
+    0b00000,
+    0b01110,
+    0b10101,
+    0b10101,
+    0b10111,
+    0b10001,
+    0b01110,
+    0b00000
+};
+
+uint8_t degree_char[8] = {
+    0b01000,
+    0b10100,
+    0b01000,
+    0b00111,
+    0b01000,
+    0b01000,
+    0b00111,
+    0b00000
+};
+
+uint8_t humidity_char[8] = {
+    0b00100,
+    0b00100,
+    0b01110,
+    0b11111,
+    0b11111,
+    0b11111,
+    0b01110,
+    0b00000
+};
 
 void i2c_master_init(void) {
     i2c_config_t conf = {
@@ -183,15 +231,82 @@ esp_err_t rx8900_set_time(datetime_t *dt) {
     return ret;
 }
 
+void lcd_create_custom_char(uint8_t location, uint8_t charmap[])
+{
+    // location: 0 to 7 (CGRAM slot number)
+    location &= 0x07;
+
+    // Send CGRAM address set command
+    lcd_send_cmd(0x40 | (location << 3));
+
+    // Write the character pattern in 8 bytes
+    for (int i = 0; i < 8; i++) {
+        lcd_send_data(charmap[i]);
+    }
+}
+
+void init_snooze_switch(void)
+{
+    gpio_config_t io_conf = {
+        .pin_bit_mask = (1ULL << SNOOZE_SWITCH_GPIO),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_NEGEDGE   // 立ち下がりエッジで割り込み
+    };
+    gpio_config(&io_conf);
+}
+
+void snooze_task(void *arg)
+{
+    uint32_t io_num;
+    static bool last_state = false;
+
+    for(;;) {
+        if(xQueueReceive(gpio_evt_queue, &io_num, portMAX_DELAY)) {
+            vTaskDelay(pdMS_TO_TICKS(20));
+            // スイッチの状態を読み取る
+            bool current_state = (gpio_get_level(SNOOZE_SWITCH_GPIO) == 0); // プルアップなので0=ON
+
+            if (current_state != last_state) {
+                snooze_enabled = current_state;
+                last_state = current_state;
+
+                // LCDに表示（例: 2行目の9文字目）
+                lcd_send_cmd(0xC0 + 9);
+                if (snooze_enabled) {
+                    lcd_send_data(0x02); // 時計アイコン
+                } else {
+                    lcd_send_data(' ');
+                }
+            }
+        }
+    }
+}
+
 void app_main(void) {
     i2c_master_init();
     lcd_init();
+    lcd_create_custom_char(0, degree_char);  // Register degree symbol to slot 0
+    lcd_create_custom_char(1, humidity_char);  // Register humidity symbol to slot 1
+    lcd_create_custom_char(2, clock_char);  // Register clock icon to slot 2
 
     // 初回だけ設定
     datetime_t set_dt = {2025, 7, 27, 15, 29, 0};
     rx8900_set_time(&set_dt);
 
     datetime_t dt;
+
+    init_snooze_switch();
+    // 割り込み用キュー
+    gpio_evt_queue = xQueueCreate(10, sizeof(uint32_t));
+
+    // 割り込みハンドラ登録
+    gpio_install_isr_service(0);
+    gpio_isr_handler_add(SNOOZE_SWITCH_GPIO, snooze_isr_handler, (void*) SNOOZE_SWITCH_GPIO);
+
+    // タスク起動
+    xTaskCreate(snooze_task, "snooze_task", 2048, NULL, 10, NULL);
     while (1) {
         if (rx8900_get_time(&dt) == ESP_OK) {
             display_datetime(&dt);
