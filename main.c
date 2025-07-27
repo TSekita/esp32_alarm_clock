@@ -5,6 +5,8 @@
 #include "freertos/queue.h"
 #include <stdio.h>
 #include <string.h>
+#include "dht.h" 
+#include "esp_log.h"
 
 #define I2C_MASTER_SCL_IO           22
 #define I2C_MASTER_SDA_IO           21
@@ -17,6 +19,8 @@
 #define SNOOZE_SWITCH_GPIO GPIO_NUM_5  // GPIO pin for snooze switch
 static QueueHandle_t gpio_evt_queue = NULL;
 volatile bool snooze_enabled = false;
+
+#define DHT_GPIO GPIO_NUM_4
 
 #define LCD_ADDR        0x27  // PCF8574のアドレス
 #define RX8900_ADDR     0x32
@@ -284,6 +288,60 @@ void snooze_task(void *arg)
     }
 }
 
+void clock_task(void *arg) {
+    datetime_t dt;
+    while (1) {
+        if (rx8900_get_time(&dt) == ESP_OK) {
+            display_datetime(&dt);
+        }
+        vTaskDelay(pdMS_TO_TICKS(1000)); // 1秒更新
+    }
+}
+
+void dht_gpio_init(void)
+{
+    gpio_config_t io_conf = {
+        .pin_bit_mask = (1ULL << DHT_GPIO), // 対象ピン
+        .mode = GPIO_MODE_INPUT_OUTPUT_OD,  // オープンドレイン
+        .pull_up_en = GPIO_PULLUP_ENABLE,   // プルアップ有効
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE
+    };
+    gpio_config(&io_conf);
+}
+
+// ----------------- 温湿度表示用関数 -----------------
+void display_temp_humidity(float temp, float hum)
+{
+    char buf_temp[17];
+    char buf_hum[17];
+    // 2行目の11文字目から温湿度表示
+    snprintf(buf_temp, sizeof(buf_temp), "%2.0f%c", temp, 0x00);
+    lcd_send_cmd(0x80 + 13); // 1行目の13列目
+    lcd_send_string(buf_temp);
+
+    snprintf(buf_hum, sizeof(buf_hum), "%c%2f%c", 0x01, hum, '%');
+    lcd_send_cmd(0xC0 + 12); // 2行目の12列目
+    lcd_send_string(buf_hum);
+}
+
+// ----------------- 温湿度読み取りタスク -----------------
+void dht_task(void *arg)
+{
+    while (1) {
+        float temperature = 0, humidity = 0;
+
+        if (dht_read_data(&temperature, &humidity) == ESP_OK) {
+            display_temp_humidity(temperature, humidity);
+        } else {
+            lcd_send_cmd(0xC0 + 11);
+            lcd_send_string("Err");
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(60000)); // 1分ごと更新
+    }
+}
+
 void app_main(void) {
     i2c_master_init();
     lcd_init();
@@ -295,7 +353,10 @@ void app_main(void) {
     datetime_t set_dt = {2025, 7, 27, 15, 29, 0};
     rx8900_set_time(&set_dt);
 
-    datetime_t dt;
+    // datetime_t dt;
+    // GPIO4 をプルアップ設定
+    dht_gpio_init();
+    dht_init(GPIO_NUM_4); // DHT11をGPIO4に接続
 
     init_snooze_switch();
     // 割り込み用キュー
@@ -307,11 +368,15 @@ void app_main(void) {
 
     // タスク起動
     xTaskCreate(snooze_task, "snooze_task", 2048, NULL, 10, NULL);
-    while (1) {
-        if (rx8900_get_time(&dt) == ESP_OK) {
-            display_datetime(&dt);
-        }
-        vTaskDelay(pdMS_TO_TICKS(1000)); // 1秒ごと更新
-    }
+    xTaskCreate(clock_task, "clock_task", 2048, NULL, 10, NULL);
+    // 温湿度読み取りタスク起動
+    xTaskCreate(dht_task, "dht_task", 2048, NULL, 5, NULL);
+//    while (1) {
+//        if (rx8900_get_time(&dt) == ESP_OK) {
+//            display_datetime(&dt);
+//        }
+//        vTaskDelay(pdMS_TO_TICKS(1000)); // 1秒ごと更新
+//    }
 }
+
 
