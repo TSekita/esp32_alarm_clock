@@ -36,12 +36,76 @@ volatile bool snooze_enabled = false;
 #define LEDC_MODE       LEDC_HIGH_SPEED_MODE
 #define LEDC_CHANNEL    LEDC_CHANNEL_0
 #define LEDC_DUTY_RES   LEDC_TIMER_10_BIT // 10ビット分解能
-//#define LEDC_DUTY       (512)             // 50%デューティ
 #define LEDC_DUTY       (1)             // 0.1%デューティ
 #define LEDC_FREQUENCY  2000              // 2kHz
 
+typedef enum {
+    MODE_NORMAL,
+    MODE_SET_YEAR,
+    MODE_SET_MONTH,
+    MODE_SET_DAY,
+    MODE_SET_HOUR,
+    MODE_SET_MINUTE,
+    MODE_SET_SECOND
+} clock_mode_t;
+
+typedef struct {
+    int year;
+    int month;
+    int day;
+    int hour;
+    int minute;
+    int second;
+    int weekday;
+} datetime_t;
+
+volatile clock_mode_t clock_mode = MODE_NORMAL;
+datetime_t setting_dt;  // 設定用バッファ
+
+#define SET_MODE GPIO_NUM_18
+#define BTN_INC  GPIO_NUM_19
+#define BTN_DEC  GPIO_NUM_16
+
+typedef struct {
+    int hour;
+    int minute;
+} alarm_time_t;
+
+volatile alarm_time_t alarm_time = {6, 30}; // 初期値: 06:30
+volatile bool alarm_enabled = true;
+volatile bool alarm_active = false;
+
+typedef enum {
+    MODE_NORMAL_A,      // 通常表示
+    MODE_SET_ALARM_H, // アラーム時設定
+    MODE_SET_ALARM_M  // アラーム分設定
+} alarm_mode_t;
+
+volatile alarm_mode_t mode = MODE_NORMAL_A;
+
+// ISRは同じようにキュー送信
+static void IRAM_ATTR btn_isr_handler(void *arg) {
+    uint32_t gpio_num = (uint32_t) arg;
+    xQueueSendFromISR(gpio_evt_queue, &gpio_num, NULL);
+}
+
+void init_buttons(void) {
+    gpio_config_t io_conf = {
+        .pin_bit_mask = (1ULL << SET_MODE) | (1ULL << BTN_INC) | (1ULL << BTN_DEC),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_NEGEDGE
+    };
+    gpio_config(&io_conf);
+
+    gpio_isr_handler_add(SET_MODE, btn_isr_handler, (void*) SET_MODE);
+    gpio_isr_handler_add(BTN_INC, btn_isr_handler, (void*) BTN_INC);
+    gpio_isr_handler_add(BTN_DEC, btn_isr_handler, (void*) BTN_DEC);
+}
+
+
 int melody[] = {880, 880, 880, 880, 880}; // ラーラーラーラーラー
-//int melody[] = {262, 330, 392, 330, 262}; // ドーミーソーミードー
 int note_duration = 400;  // 1音400ms
 int pause_duration = 100; // 音間の無音100ms
 
@@ -98,7 +162,6 @@ static void IRAM_ATTR snooze_isr_handler(void *arg)
     uint32_t gpio_num = (uint32_t) arg;
     xQueueSendFromISR(gpio_evt_queue, &gpio_num, NULL);
 }
-
 
 // 時計のアイコン用のカスタムキャラクター
 uint8_t clock_char[8] = {
@@ -218,16 +281,6 @@ uint8_t bcd_to_dec(uint8_t val) {
 uint8_t dec_to_bcd(uint8_t val) {
     return ((val / 10) << 4) | (val % 10);
 }
-
-typedef struct {
-    int year;
-    int month;
-    int day;
-    int hour;
-    int minute;
-    int second;
-    int weekday;
-} datetime_t;
 
 esp_err_t rx8900_get_time(datetime_t *dt) {
     uint8_t data[7];
@@ -361,10 +414,17 @@ void snooze_task(void *arg)
 void clock_task(void *arg) {
     datetime_t dt;
     while (1) {
-        if (rx8900_get_time(&dt) == ESP_OK) {
-            display_datetime(&dt);
+        if (clock_mode == MODE_NORMAL) {
+            if (rx8900_get_time(&dt) == ESP_OK) {
+                display_datetime(&dt);
+            }
+        } else {
+            // 設定中はsetting_dtを表示
+            display_datetime(&setting_dt);
+            // 設定中の項目にカーソル点滅を追加するならここで制御
+            lcd_send_cmd(0x0F);
         }
-        vTaskDelay(pdMS_TO_TICKS(1000)); // 1秒更新
+        vTaskDelay(pdMS_TO_TICKS(500));
     }
 }
 
@@ -412,7 +472,99 @@ void dht_task(void *arg)
             lcd_set_cursor(1, 12);
             lcd_send_string("---");
         }
-        vTaskDelay(pdMS_TO_TICKS(10000)); // 分ごと更新
+        vTaskDelay(pdMS_TO_TICKS(10000)); // 10秒ごと更新
+    }
+}
+
+void button_task(void *arg) {
+    uint32_t io_num;
+    //datetime_t current_time;
+    while (1) {
+        if (xQueueReceive(gpio_evt_queue, &io_num, portMAX_DELAY)) {
+            vTaskDelay(pdMS_TO_TICKS(100)); // チャタリング対策
+
+            if (gpio_get_level(io_num) == 0) { // プルアップなので0=押下
+                if (io_num == SET_MODE) {
+                    // モード切替
+                    if (clock_mode == MODE_NORMAL) {
+                        // 現在のRTC時間を読み出して編集バッファへ
+                        rx8900_get_time(&setting_dt);
+                        clock_mode = MODE_SET_YEAR;
+                    } else {
+                        // 次の項目へ進む
+                        if (clock_mode == MODE_SET_SECOND) {
+                            // 最後の項目 → RTCに反映
+                            rx8900_set_time(&setting_dt);
+                            clock_mode = MODE_NORMAL;
+                        } else {
+                            clock_mode++;
+                        }
+                    }
+                } else if (io_num == BTN_INC) {
+                    // 値増加
+                    if (clock_mode != MODE_NORMAL) {
+                        switch (clock_mode) {
+                            case MODE_SET_YEAR:
+                                setting_dt.year++;
+                                if (setting_dt.year > 2099) setting_dt.year = 2000;
+                                break;
+                            case MODE_SET_MONTH:
+                                setting_dt.month++;
+                                if (setting_dt.month > 12) setting_dt.month = 1;
+                                break;
+                            case MODE_SET_DAY:
+                                setting_dt.day++;
+                                if (setting_dt.day > 31) setting_dt.day = 1;
+                                break;
+                            case MODE_SET_HOUR:
+                                setting_dt.hour++;
+                                if (setting_dt.hour > 23) setting_dt.hour = 0;
+                                break;
+                            case MODE_SET_MINUTE:
+                                setting_dt.minute++;
+                                if (setting_dt.minute > 59) setting_dt.minute = 0;
+                                break;
+                            case MODE_SET_SECOND:
+                                setting_dt.second++;
+                                if (setting_dt.second > 59) setting_dt.second = 0;
+                                break;
+                            default: break;
+                        }
+                    }
+                } else if (io_num == BTN_DEC) {
+                    // 値減少
+                    if (clock_mode != MODE_NORMAL) {
+                        switch (clock_mode) {
+                            case MODE_SET_YEAR:
+                                setting_dt.year--;
+                                if (setting_dt.year < 2000) setting_dt.year = 2099;
+                                break;
+                            case MODE_SET_MONTH:
+                                setting_dt.month--;
+                                if (setting_dt.month < 1) setting_dt.month = 12;
+                                break;
+                            case MODE_SET_DAY:
+                                setting_dt.day--;
+                                if (setting_dt.day < 1) setting_dt.day = 31;
+                                break;
+                            case MODE_SET_HOUR:
+                                setting_dt.hour--;
+                                if (setting_dt.hour < 0) setting_dt.hour = 23;
+                                break;
+                            case MODE_SET_MINUTE:
+                                setting_dt.minute--;
+                                if (setting_dt.minute < 0) setting_dt.minute = 59;
+                                break;
+                            case MODE_SET_SECOND:
+                                setting_dt.second--;
+                                if (setting_dt.second < 0) setting_dt.second = 59;
+                                break;
+                            default: break;
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -427,15 +579,12 @@ void app_main(void) {
     datetime_t set_dt = {2025, 7, 27, 15, 29, 0, 0}; // {year, month, day, hour, minute, second, weekday}
     rx8900_set_time(&set_dt);
 
-    // datetime_t dt;
     // GPIO4 をプルアップ設定
     dht_gpio_init();
     dht_init(GPIO_NUM_4); // DHT11をGPIO4に接続
-    // vTaskDelay(pdMS_TO_TICKS(2000));
 
     init_snooze_switch();
     buzzer_init();
-    //play_soft_alarm(); 
     // 割り込み用キュー
     gpio_evt_queue = xQueueCreate(10, sizeof(uint32_t));
 
@@ -450,12 +599,6 @@ void app_main(void) {
     xTaskCreate(dht_task, "dht_task", 2048, NULL, 5, NULL);
     // ブザーは別タスクで鳴らす
     xTaskCreate(buzzer_task, "buzzer_task", 2048, NULL, 5, NULL);
-//    while (1) {
-//        if (rx8900_get_time(&dt) == ESP_OK) {
-//            display_datetime(&dt);
-//        }
-//        vTaskDelay(pdMS_TO_TICKS(1000)); // 1秒ごと更新
-//    }
+    init_buttons();
+    xTaskCreate(button_task, "button_task", 2048, NULL, 10, NULL);
 }
-
-
