@@ -7,6 +7,8 @@
 #include <string.h>
 #include "dht.h" 
 #include "esp_log.h"
+#include "driver/ledc.h"
+#include "esp_err.h"
 
 #define I2C_MASTER_SCL_IO           22
 #define I2C_MASTER_SDA_IO           21
@@ -28,6 +30,67 @@ volatile bool snooze_enabled = false;
 #define LCD_BACKLIGHT   0x08
 #define ENABLE          0x04
 #define RS              0x01
+
+#define BUZZER_PIN 17
+#define LEDC_TIMER      LEDC_TIMER_0
+#define LEDC_MODE       LEDC_HIGH_SPEED_MODE
+#define LEDC_CHANNEL    LEDC_CHANNEL_0
+#define LEDC_DUTY_RES   LEDC_TIMER_10_BIT // 10ビット分解能
+//#define LEDC_DUTY       (512)             // 50%デューティ
+#define LEDC_DUTY       (1)             // 0.1%デューティ
+#define LEDC_FREQUENCY  2000              // 2kHz
+
+int melody[] = {880, 880, 880, 880, 880}; // ラーラーラーラーラー
+//int melody[] = {262, 330, 392, 330, 262}; // ドーミーソーミードー
+int note_duration = 400;  // 1音400ms
+int pause_duration = 100; // 音間の無音100ms
+
+void buzzer_init(void)
+{
+    // タイマー設定
+    ledc_timer_config_t ledc_timer = {
+        .speed_mode       = LEDC_MODE,
+        .timer_num        = LEDC_TIMER,
+        .duty_resolution  = LEDC_DUTY_RES,
+        .freq_hz          = LEDC_FREQUENCY,
+        .clk_cfg          = LEDC_AUTO_CLK
+    };
+    ledc_timer_config(&ledc_timer);
+
+    // チャンネル設定
+    ledc_channel_config_t ledc_channel = {
+        .speed_mode     = LEDC_MODE,
+        .channel        = LEDC_CHANNEL,
+        .timer_sel      = LEDC_TIMER,
+        .intr_type      = LEDC_INTR_DISABLE,
+        .gpio_num       = BUZZER_PIN,
+        .duty           = 0,
+        .hpoint         = 0
+    };
+    ledc_channel_config(&ledc_channel);
+}
+
+void play_soft_alarm() {
+    for (int i = 0; i < 5; i++) {
+        // 周波数設定
+        ledc_set_freq(LEDC_MODE, LEDC_TIMER, melody[i]);
+        // 音を鳴らす
+        ledc_set_duty(LEDC_MODE, LEDC_CHANNEL, LEDC_DUTY);
+        ledc_update_duty(LEDC_MODE, LEDC_CHANNEL);
+        vTaskDelay(pdMS_TO_TICKS(note_duration));
+
+        // 無音にする
+        ledc_set_duty(LEDC_MODE, LEDC_CHANNEL, 0);
+        ledc_update_duty(LEDC_MODE, LEDC_CHANNEL);
+        vTaskDelay(pdMS_TO_TICKS(pause_duration));
+    }
+}
+
+// ブザー再生タスク
+void buzzer_task(void *arg) {
+    play_soft_alarm();  // ブザー再生
+    vTaskDelete(NULL);  // 再生後タスク終了
+}
 
 // 割り込みハンドラ
 static void IRAM_ATTR snooze_isr_handler(void *arg)
@@ -371,6 +434,8 @@ void app_main(void) {
     // vTaskDelay(pdMS_TO_TICKS(2000));
 
     init_snooze_switch();
+    buzzer_init();
+    //play_soft_alarm(); 
     // 割り込み用キュー
     gpio_evt_queue = xQueueCreate(10, sizeof(uint32_t));
 
@@ -383,6 +448,8 @@ void app_main(void) {
     xTaskCreate(clock_task, "clock_task", 2048, NULL, 10, NULL);
     // 温湿度読み取りタスク起動
     xTaskCreate(dht_task, "dht_task", 2048, NULL, 5, NULL);
+    // ブザーは別タスクで鳴らす
+    xTaskCreate(buzzer_task, "buzzer_task", 2048, NULL, 5, NULL);
 //    while (1) {
 //        if (rx8900_get_time(&dt) == ESP_OK) {
 //            display_datetime(&dt);
