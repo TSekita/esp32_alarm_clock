@@ -141,6 +141,13 @@ void lcd_send_string(const char *str) {
     }
 }
 
+// カーソル移動関数
+void lcd_set_cursor(uint8_t row, uint8_t col)
+{
+    uint8_t addr = (row == 0) ? col : (0x40 + col);
+    lcd_send_cmd(0x80 | addr);
+}
+
 uint8_t bcd_to_dec(uint8_t val) {
     return ((val >> 4) * 10) + (val & 0x0F);
 }
@@ -200,13 +207,13 @@ int calc_weekday(int y, int m, int d) {
 }
 
 void display_datetime(datetime_t *dt) {
-    char line1[17], line2[17];
+    char line1[13], line2[9];
     snprintf(line1, sizeof(line1), "%04d%02d%02d%s", dt->year, dt->month, dt->day, weekday_str[dt->weekday]);
     snprintf(line2, sizeof(line2), "%02d:%02d:%02d", dt->hour, dt->minute, dt->second);
 
-    lcd_send_cmd(0x80); // 1行目
+    lcd_set_cursor(0, 0); // 1行目
     lcd_send_string(line1);
-    lcd_send_cmd(0xC0); // 2行目
+    lcd_set_cursor(1, 0); // 2行目
     lcd_send_string(line2);
 }
 
@@ -219,7 +226,7 @@ esp_err_t rx8900_set_time(datetime_t *dt) {
     data[0] = dec_to_bcd(dt->second);
     data[1] = dec_to_bcd(dt->minute);
     data[2] = dec_to_bcd(dt->hour);
-    data[3] = weekday;
+    data[3] = (uint8_t)weekday;
     data[4] = dec_to_bcd(dt->day);
     data[5] = dec_to_bcd(dt->month);
     data[6] = dec_to_bcd(dt->year - 2000);
@@ -277,7 +284,7 @@ void snooze_task(void *arg)
                 last_state = current_state;
 
                 // LCDに表示（例: 2行目の9文字目）
-                lcd_send_cmd(0xC0 + 9);
+                lcd_set_cursor(1, 9);
                 if (snooze_enabled) {
                     lcd_send_data(0x02); // 時計アイコン
                 } else {
@@ -316,12 +323,14 @@ void display_temp_humidity(float temp, float hum)
     char buf_temp[17];
     char buf_hum[17];
     // 2行目の11文字目から温湿度表示
-    snprintf(buf_temp, sizeof(buf_temp), "%2.0f%c", temp, 0x00);
-    lcd_send_cmd(0x80 + 13); // 1行目の13列目
+    snprintf(buf_temp, sizeof(buf_temp), "%2.0f", temp);
+    lcd_set_cursor(0, 13);
     lcd_send_string(buf_temp);
+    lcd_send_data(0x00);
 
-    snprintf(buf_hum, sizeof(buf_hum), "%c%2f%c", 0x01, hum, '%');
-    lcd_send_cmd(0xC0 + 12); // 2行目の12列目
+    snprintf(buf_hum, sizeof(buf_hum), "%2.0f%%", hum);
+    lcd_set_cursor(1, 12);
+    lcd_send_data(0x01);
     lcd_send_string(buf_hum);
 }
 
@@ -329,16 +338,18 @@ void display_temp_humidity(float temp, float hum)
 void dht_task(void *arg)
 {
     while (1) {
-        float temperature = 0, humidity = 0;
+        float temperature = 0.0f, humidity = 0.0f;
 
+        vTaskDelay(pdMS_TO_TICKS(2000));
         if (dht_read_data(&temperature, &humidity) == ESP_OK) {
             display_temp_humidity(temperature, humidity);
         } else {
-            lcd_send_cmd(0xC0 + 11);
-            lcd_send_string("Err");
+            lcd_set_cursor(0, 13);
+            lcd_send_string("---");
+            lcd_set_cursor(1, 12);
+            lcd_send_string("---");
         }
-
-        vTaskDelay(pdMS_TO_TICKS(60000)); // 1分ごと更新
+        vTaskDelay(pdMS_TO_TICKS(10000)); // 分ごと更新
     }
 }
 
@@ -350,13 +361,14 @@ void app_main(void) {
     lcd_create_custom_char(2, clock_char);  // Register clock icon to slot 2
 
     // 初回だけ設定
-    datetime_t set_dt = {2025, 7, 27, 15, 29, 0};
+    datetime_t set_dt = {2025, 7, 27, 15, 29, 0, 0}; // {year, month, day, hour, minute, second, weekday}
     rx8900_set_time(&set_dt);
 
     // datetime_t dt;
     // GPIO4 をプルアップ設定
     dht_gpio_init();
     dht_init(GPIO_NUM_4); // DHT11をGPIO4に接続
+    // vTaskDelay(pdMS_TO_TICKS(2000));
 
     init_snooze_switch();
     // 割り込み用キュー
