@@ -18,9 +18,9 @@
 #define I2C_MASTER_RX_BUF_DISABLE   0
 #define I2C_MASTER_TIMEOUT_MS       1000
 
-#define SNOOZE_SWITCH_GPIO GPIO_NUM_5  // GPIO pin for snooze switch
+#define ALARM_ENABLE_SWITCH_GPIO GPIO_NUM_5  // GPIO pin for alarm enable switch
 static QueueHandle_t gpio_evt_queue = NULL;
-volatile bool snooze_enabled = false;
+volatile bool alarm_enabled = false;
 
 #define DHT_GPIO GPIO_NUM_4
 
@@ -62,6 +62,7 @@ typedef struct {
 volatile clock_mode_t clock_mode = MODE_NORMAL;
 datetime_t setting_dt;  // 設定用バッファ
 
+#define SET_ALARM_MODE GPIO_NUM_0
 #define SET_MODE GPIO_NUM_18
 #define BTN_INC  GPIO_NUM_19
 #define BTN_DEC  GPIO_NUM_16
@@ -72,8 +73,6 @@ typedef struct {
 } alarm_time_t;
 
 volatile alarm_time_t alarm_time = {6, 30}; // 初期値: 06:30
-volatile bool alarm_enabled = true;
-volatile bool alarm_active = false;
 
 typedef enum {
     MODE_NORMAL_A,      // 通常表示
@@ -81,7 +80,8 @@ typedef enum {
     MODE_SET_ALARM_M  // アラーム分設定
 } alarm_mode_t;
 
-volatile alarm_mode_t mode = MODE_NORMAL_A;
+volatile alarm_mode_t alarm_mode = MODE_NORMAL_A;
+datetime_t alarm_dt;  // アラーム時刻格納用
 
 // ISRは同じようにキュー送信
 static void IRAM_ATTR btn_isr_handler(void *arg) {
@@ -91,7 +91,7 @@ static void IRAM_ATTR btn_isr_handler(void *arg) {
 
 void init_buttons(void) {
     gpio_config_t io_conf = {
-        .pin_bit_mask = (1ULL << SET_MODE) | (1ULL << BTN_INC) | (1ULL << BTN_DEC),
+        .pin_bit_mask = (1ULL << SET_ALARM_MODE) | (1ULL << SET_MODE) | (1ULL << BTN_INC) | (1ULL << BTN_DEC),
         .mode = GPIO_MODE_INPUT,
         .pull_up_en = GPIO_PULLUP_ENABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
@@ -99,11 +99,11 @@ void init_buttons(void) {
     };
     gpio_config(&io_conf);
 
+    gpio_isr_handler_add(SET_ALARM_MODE, btn_isr_handler, (void*) SET_ALARM_MODE);
     gpio_isr_handler_add(SET_MODE, btn_isr_handler, (void*) SET_MODE);
     gpio_isr_handler_add(BTN_INC, btn_isr_handler, (void*) BTN_INC);
     gpio_isr_handler_add(BTN_DEC, btn_isr_handler, (void*) BTN_DEC);
 }
-
 
 int melody[] = {880, 880, 880, 880, 880}; // ラーラーラーラーラー
 int note_duration = 400;  // 1音400ms
@@ -157,7 +157,7 @@ void buzzer_task(void *arg) {
 }
 
 // 割り込みハンドラ
-static void IRAM_ATTR snooze_isr_handler(void *arg)
+static void IRAM_ATTR alarm_isr_handler(void *arg)
 {
     uint32_t gpio_num = (uint32_t) arg;
     xQueueSendFromISR(gpio_evt_queue, &gpio_num, NULL);
@@ -372,10 +372,10 @@ void lcd_create_custom_char(uint8_t location, uint8_t charmap[])
     }
 }
 
-void init_snooze_switch(void)
+void init_alarm_switch(void)
 {
     gpio_config_t io_conf = {
-        .pin_bit_mask = (1ULL << SNOOZE_SWITCH_GPIO),
+        .pin_bit_mask = (1ULL << ALARM_ENABLE_SWITCH_GPIO),
         .mode = GPIO_MODE_INPUT,
         .pull_up_en = GPIO_PULLUP_ENABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
@@ -384,7 +384,7 @@ void init_snooze_switch(void)
     gpio_config(&io_conf);
 }
 
-void snooze_task(void *arg)
+void alarm_task(void *arg)
 {
     uint32_t io_num;
     static bool last_state = false;
@@ -393,15 +393,15 @@ void snooze_task(void *arg)
         if(xQueueReceive(gpio_evt_queue, &io_num, portMAX_DELAY)) {
             vTaskDelay(pdMS_TO_TICKS(20));
             // スイッチの状態を読み取る
-            bool current_state = (gpio_get_level(SNOOZE_SWITCH_GPIO) == 0); // プルアップなので0=ON
+            bool current_state = (gpio_get_level(ALARM_ENABLE_SWITCH_GPIO) == 0); // プルアップなので0=ON
 
             if (current_state != last_state) {
-                snooze_enabled = current_state;
+                alarm_enabled = current_state;
                 last_state = current_state;
 
                 // LCDに表示（例: 2行目の9文字目）
                 lcd_set_cursor(1, 9);
-                if (snooze_enabled) {
+                if (alarm_enabled) {
                     lcd_send_data(0x02); // 時計アイコン
                 } else {
                     lcd_send_data(' ');
@@ -422,8 +422,14 @@ void clock_task(void *arg) {
             // 設定中はsetting_dtを表示
             display_datetime(&setting_dt);
             // 設定中の項目にカーソル点滅を追加するならここで制御
-            lcd_send_cmd(0x0F);
         }
+        if (alarm_enabled &&
+            dt.hour == alarm_time.hour &&
+            dt.minute == alarm_time.minute &&
+            dt.second == 0) {
+            xTaskCreate(buzzer_task, "buzzer_task", 2048, NULL, 5, NULL);
+        }
+
         vTaskDelay(pdMS_TO_TICKS(500));
     }
 }
@@ -478,7 +484,7 @@ void dht_task(void *arg)
 
 void button_task(void *arg) {
     uint32_t io_num;
-    //datetime_t current_time;
+
     while (1) {
         if (xQueueReceive(gpio_evt_queue, &io_num, portMAX_DELAY)) {
             vTaskDelay(pdMS_TO_TICKS(100)); // チャタリング対策
@@ -498,6 +504,20 @@ void button_task(void *arg) {
                             clock_mode = MODE_NORMAL;
                         } else {
                             clock_mode++;
+                        }
+                    }
+                } else if (io_num == SET_ALARM_MODE) {
+                    // モード切替
+                    if (alarm_mode == MODE_NORMAL_A) {
+                        rx8900_set_time(&alarm_dt);
+                        alarm_mode = MODE_SET_ALARM_H;
+                    } else {
+                        // 次の項目へ進む
+                        if (alarm_mode == MODE_SET_ALARM_M) {
+                            rx8900_set_time(&alarm_dt);
+                            alarm_mode = MODE_NORMAL_A;
+                        } else {
+                            alarm_mode++;
                         }
                     }
                 } else if (io_num == BTN_INC) {
@@ -527,6 +547,18 @@ void button_task(void *arg) {
                             case MODE_SET_SECOND:
                                 setting_dt.second++;
                                 if (setting_dt.second > 59) setting_dt.second = 0;
+                                break;
+                            default: break;
+                        }
+                    } else if (alarm_mode != MODE_NORMAL_A) {
+                        switch (alarm_mode) {
+                            case MODE_SET_ALARM_H:
+                                alarm_dt.hour++;
+                                if (alarm_dt.hour > 23) alarm_dt.hour = 0;
+                                break;
+                            case MODE_SET_ALARM_M:
+                                alarm_dt.minute++;
+                                if (alarm_dt.minute > 59) alarm_dt.minute = 0;
                                 break;
                             default: break;
                         }
@@ -561,6 +593,18 @@ void button_task(void *arg) {
                                 break;
                             default: break;
                         }
+                    } else if (alarm_mode != MODE_NORMAL_A) {
+                        switch (alarm_mode) {
+                            case MODE_SET_ALARM_H:
+                                alarm_dt.hour--;
+                                if (alarm_dt.hour < 0) alarm_dt.hour = 23;
+                                break;
+                            case MODE_SET_ALARM_M:
+                                alarm_dt.minute--;
+                                if (alarm_dt.minute < 0) alarm_dt.minute = 59;
+                                break;
+                            default: break;
+                        }
                     }
                 }
             }
@@ -583,22 +627,22 @@ void app_main(void) {
     dht_gpio_init();
     dht_init(GPIO_NUM_4); // DHT11をGPIO4に接続
 
-    init_snooze_switch();
+    init_alarm_switch();
     buzzer_init();
     // 割り込み用キュー
     gpio_evt_queue = xQueueCreate(10, sizeof(uint32_t));
 
     // 割り込みハンドラ登録
     gpio_install_isr_service(0);
-    gpio_isr_handler_add(SNOOZE_SWITCH_GPIO, snooze_isr_handler, (void*) SNOOZE_SWITCH_GPIO);
+    gpio_isr_handler_add(ALARM_ENABLE_SWITCH_GPIO, alarm_isr_handler, (void*) ALARM_ENABLE_SWITCH_GPIO);
 
     // タスク起動
-    xTaskCreate(snooze_task, "snooze_task", 2048, NULL, 10, NULL);
+    xTaskCreate(alarm_task, "snooze_task", 2048, NULL, 10, NULL);
     xTaskCreate(clock_task, "clock_task", 2048, NULL, 10, NULL);
     // 温湿度読み取りタスク起動
     xTaskCreate(dht_task, "dht_task", 2048, NULL, 5, NULL);
     // ブザーは別タスクで鳴らす
-    xTaskCreate(buzzer_task, "buzzer_task", 2048, NULL, 5, NULL);
+    //xTaskCreate(buzzer_task, "buzzer_task", 2048, NULL, 5, NULL);
     init_buttons();
     xTaskCreate(button_task, "button_task", 2048, NULL, 10, NULL);
 }
