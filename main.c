@@ -324,7 +324,7 @@ int calc_weekday(int y, int m, int d) {
 
 void display_datetime(datetime_t *dt) {
     char line1[13], line2[9];
-    snprintf(line1, sizeof(line1), "%04d%02d%02d%s", dt->year, dt->month, dt->day, weekday_str[dt->weekday]);
+    snprintf(line1, sizeof(line1), "%4d/%02d/%02d", dt->year, dt->month, dt->day);
     snprintf(line2, sizeof(line2), "%02d:%02d:%02d", dt->hour, dt->minute, dt->second);
 
     lcd_set_cursor(0, 0); // 1行目
@@ -334,6 +334,39 @@ void display_datetime(datetime_t *dt) {
 }
 
 esp_err_t rx8900_set_time(datetime_t *dt) {
+    uint8_t data[7];
+
+    // 曜日を計算（0=Sun〜6=Sat）
+    int weekday = calc_weekday(dt->year, dt->month, dt->day);
+
+    data[0] = dec_to_bcd(dt->second);
+    data[1] = dec_to_bcd(dt->minute);
+    data[2] = dec_to_bcd(dt->hour);
+    data[3] = (uint8_t)weekday;
+    data[4] = dec_to_bcd(dt->day);
+    data[5] = dec_to_bcd(dt->month);
+    data[6] = dec_to_bcd(dt->year - 2000);
+
+    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (RX8900_ADDR << 1) | I2C_MASTER_WRITE, true);
+    i2c_master_write_byte(cmd, 0x00, true); // 秒レジスタから書き込み
+    i2c_master_write(cmd, data, 7, true);
+    i2c_master_stop(cmd);
+    esp_err_t ret = i2c_master_cmd_begin(I2C_MASTER_NUM, cmd, pdMS_TO_TICKS(1000));
+    i2c_cmd_link_delete(cmd);
+    return ret;
+}
+
+void display_alarmtime(datetime_t *dt) {
+    char line[6];
+    snprintf(line, sizeof(line), "%02d:%02d", dt->hour, dt->minute);
+
+    lcd_set_cursor(0, 11); // 1行目
+    lcd_send_string(line);
+}
+
+esp_err_t alarm_set_time(datetime_t *dt) {
     uint8_t data[7];
 
     // 曜日を計算（0=Sun〜6=Sat）
@@ -434,6 +467,29 @@ void clock_task(void *arg) {
     }
 }
 
+void alarm_task(void *arg) {
+    datetime_t dt;
+    while (1) {
+        if (alarm_mode == MODE_NORMAL) {
+            if (rx8900_get_time(&dt) == ESP_OK) {
+                display_datetime(&dt);
+            }
+        } else {
+            // 設定中はsetting_dtを表示
+            display_datetime(&setting_dt);
+            // 設定中の項目にカーソル点滅を追加するならここで制御
+        }
+        if (alarm_enabled &&
+            dt.hour == alarm_time.hour &&
+            dt.minute == alarm_time.minute &&
+            dt.second == 0) {
+            xTaskCreate(buzzer_task, "buzzer_task", 2048, NULL, 5, NULL);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+}
+
 void dht_gpio_init(void)
 {
     gpio_config_t io_conf = {
@@ -449,18 +505,14 @@ void dht_gpio_init(void)
 // ----------------- 温湿度表示用関数 -----------------
 void display_temp_humidity(float temp, float hum)
 {
-    char buf_temp[17];
-    char buf_hum[17];
-    // 2行目の11文字目から温湿度表示
-    snprintf(buf_temp, sizeof(buf_temp), "%2.0f", temp);
-    lcd_set_cursor(0, 13);
-    lcd_send_string(buf_temp);
+    char buf_temp_hum[8];
+    // 1行目の10文字目から温湿度表示
+    snprintf(buf_temp_hum, sizeof(buf_temp_hum), "%2.0f  %2.0f%%", temp, hum);
+    lcd_set_cursor(1, 9);
+    lcd_send_string(buf_temp_hum);
+    lcd_set_cursor(1, 11);
     lcd_send_data(0x00);
-
-    snprintf(buf_hum, sizeof(buf_hum), "%2.0f%%", hum);
-    lcd_set_cursor(1, 12);
-    lcd_send_data(0x01);
-    lcd_send_string(buf_hum);
+    lcd_send_data(0x02);
 }
 
 // ----------------- 温湿度読み取りタスク -----------------
@@ -473,10 +525,12 @@ void dht_task(void *arg)
         if (dht_read_data(&temperature, &humidity) == ESP_OK) {
             display_temp_humidity(temperature, humidity);
         } else {
-            lcd_set_cursor(0, 13);
-            lcd_send_string("---");
-            lcd_set_cursor(1, 12);
-            lcd_send_string("---");
+            lcd_set_cursor(1, 9);
+            lcd_send_string("--");
+            lcd_send_data(0x00);
+            lcd_send_data(0x02);
+            lcd_set_cursor(1, 13);
+            lcd_send_string("--%%");
         }
         vTaskDelay(pdMS_TO_TICKS(10000)); // 10秒ごと更新
     }
@@ -616,8 +670,8 @@ void app_main(void) {
     i2c_master_init();
     lcd_init();
     lcd_create_custom_char(0, degree_char);  // Register degree symbol to slot 0
-    lcd_create_custom_char(1, humidity_char);  // Register humidity symbol to slot 1
-    lcd_create_custom_char(2, clock_char);  // Register clock icon to slot 2
+    lcd_create_custom_char(1, clock_char);  // Register clock icon to slot 1
+    lcd_create_custom_char(2, humidity_char);  // Register humidity symbol to slot 2
 
     // 初回だけ設定
     datetime_t set_dt = {2025, 7, 27, 15, 29, 0, 0}; // {year, month, day, hour, minute, second, weekday}
